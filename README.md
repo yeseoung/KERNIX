@@ -18,21 +18,16 @@ The project aims to build a simple and efficient foundation for machine learning
 ### Example
 
 ```c
-#include <kernix.h>
-#include <stdlib.h>
+#include "kernix.h"
 
-int main(void) {
-    int rows = 3;
-    int cols = 3;
+int main(){
+    
+    int_tensor* train_x = int_zeros(2,2);
 
-    int *train_x = calloc(rows * cols, sizeof(int));
-    if (train_x == NULL) {
-        return 1;
-    }
+    show_ints(train_x);
 
-    show_matrix(train_x, rows, cols);
+    int_free(train_x);
 
-    free(train_x);
     return 0;
 }
 ```
