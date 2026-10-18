@@ -1,2 +1,2 @@
-gcc -Wall -Wextra -std=c11 -I../include test.c -o test
+gcc -O2 -Wall -Wextra -std=c11 -I../include test.c -o test
 테스트 실행
