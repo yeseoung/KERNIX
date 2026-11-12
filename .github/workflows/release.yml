@@ -1,0 +1,22 @@
+# Pushing a tag like v0.1.0 builds on Apple Silicon and publishes a GitHub Release
+# with the notes in .github/release-notes/<tag>.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14  # Apple Silicon: the build uses -mcpu=apple-m1, Accelerate and Metal
+    steps:
+      - uses: actions/checkout@v4
+      - run: make all
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: KERNIX ${{ github.ref_name }}
+          body_path: .github/release-notes/${{ github.ref_name }}.md
+          prerelease: true
