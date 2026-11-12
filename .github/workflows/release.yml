@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14  # Apple Silicon: the build uses -mcpu=apple-m1, Accelerate and Metal
+    runs-on: macos-latest  # Apple Silicon: the build uses -mcpu=apple-m1, Accelerate and Metal
     steps:
       - uses: actions/checkout@v4
       - run: make all
