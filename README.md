@@ -211,7 +211,7 @@ Figures come from the [Benchmarks](#benchmarks) section (Apple M1).
 
 | Strength | Why | Measured |
 |---|---|---|
-| **Fast single-sample inference** | No per-op framework overhead (PyTorch CPU about 30–60 µs, MPS about 150–300 µs) | Sign language models per frame **3.1–3.7×** vs TFLite, GPT **13.9×**, ResNet **2.0×** (sections 7 and 9) |
+| **Fast single-sample inference** | No per-op framework overhead (PyTorch CPU about 30–60 µs, MPS about 150–300 µs) | Sign language models per frame **3.1–3.7×** vs TFLite, GPT **13.9×**, ResNet **2.6×** (sections 7 and 9) |
 | **Fast small and medium tensor ops** | Accelerate SIMD functions run directly, split into 32 KB ranges over GCD | Median **2.2–3.3×** vs best PyTorch backend for 27 ops at 256²–1024² (section 4) |
 | **CPU and GPU at once** | On unified memory, the GPU (MPS) and AMX compute different rows of the same output buffer without copies. PyTorch uses one device at a time | Large matmul 1.1–1.5× vs PyTorch MPS, small and medium 2–250× (section 2) |
 | **Op fusion** | `relu(a·x + b)` in one pass over memory (PyTorch eager makes three) | 1.6–9.9× vs best PyTorch (section 3) |
@@ -222,7 +222,8 @@ Figures come from the [Benchmarks](#benchmarks) section (Apple M1).
 | **Any batch size** | The same `.knx` accepts any batch | The project's `.tflite` files are fixed to batch 1 |
 
 **Limitations**
-- **Large batches** are faster in PyTorch MPS: MLP at batch 4096 runs at 0.86× (section 6), ResNet at batch 64 at 0.54× (section 9).
+- **Large batches** are faster in PyTorch MPS for MLPs: batch 4096 runs at 0.86× (section 6). ResNet at batch 64 is on par (1.0×, section 9).
+- **CNNs are faster in Core ML**: on the ResNet in section 9, Core ML is 1.9× faster at batch 1 and 13× faster at batch 64 (Neural Engine, float16).
 - **Elementwise ops at 4096² and above** are memory-bandwidth bound and match PyTorch.
 - **The int8 fingerspelling model** agrees with TFLite on only 98.94% of confirmed webcam predictions, below the 99% target.
 - **Input shapes are fixed in the file** (no dynamic sequence length). Training is not supported.
@@ -246,7 +247,7 @@ docs/                     Design documents
 
 **How the model runtime works**
 - **Value storage**: every value in the graph has a channels-last shape for one sample (image H×W×C, sequence T×F). Buffers hold it as 2-D: `(batch · product of leading axes) × channels`.
-- **Convolution**: im2col followed by a single matmul, so it reuses the GPU+AMX split matmul. 1×1 convolutions skip im2col; depthwise convolutions use channel-wise vector ops.
+- **Convolution**: im2col and matmul run tile by tile (2 MB tiles across 4 parallel lanes), so the unrolled matrix stays in cache and one lane unrolls while another uses AMX. All convolutions share one tile-sized im2col buffer, so it does not grow with the batch. 1×1 convolutions skip im2col; depthwise convolutions use channel-wise vector ops.
 - **Zero-copy reshapes**: Flatten and Reshape only change the view.
 - **Buffer reuse**: the loader reuses storage buffers based on value lifetimes, and elementwise ops that read their input for the last time run in place. Activations after matmul and convolution are fused.
 - **PyTorch axis order**: NCHW is handled at export by remapping axes, inserting a transpose only where one is really needed.
@@ -468,13 +469,13 @@ When a batch exceeds the workspace limit, `forward` runs the samples in chunks. 
 
 | Model | Batch | PyTorch CPU | PyTorch MPS | **KERNIX** | vs best PyTorch |
 |---|---:|---:|---:|---:|---:|
-| ResNet (32 channels, 4 basic blocks + SE), input 3×32×32 | 1 | 1.23 ms | 2.95 ms | **0.62 ms** | **2.0×** |
-| | 64 | 64.2 ms | 20.8 ms | 38.7 ms | 0.54× (MPS is faster) |
+| ResNet (32 channels, 4 basic blocks + SE), input 3×32×32 | 1 | 1.21 ms | 3.40 ms | **0.46 ms** | **2.6×** |
+| | 64 | 65.8 ms | 20.8 ms | **20.8 ms** | 1.0× |
 | GPT (embedding 16, 4 heads, 2 layers, causal mask), 10 tokens | 1 | 0.27 ms | 1.21 ms | **0.019 ms** | **13.9×** |
 | | 64 | 1.72 ms | 1.52 ms | **0.45 ms** | **3.3×** |
 
 - Single-sample inference is much faster because there is no per-op PyTorch overhead.
-- Large-batch CNNs are slower than MPS because im2col and pooling run on the CPU.
+- Large-batch CNNs now match PyTorch MPS using the CPU and AMX only, since im2col runs in cache-sized tiles. Core ML with the Neural Engine is still much faster (see [Limitations](#strengths-and-limitations)).
 - Correctness: all 17 PyTorch models and 21 Keras models are within 2e-4 relative error of the original (about 1e-7 in practice, excluding int8).
 
 ## Documentation

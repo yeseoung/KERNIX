@@ -250,7 +250,7 @@ typedef struct kernix_model {
     float_tensor* out_all; /* 나눠 실행할 때 모은 전체 출력 (배치×out_dim) */
     size_t ws_limit;       /* 작업 버퍼 상한 (바이트), 0 = 제한 없음 */
     size_t ws_per_sample;  /* 표본 하나당 작업 버퍼 float 수 (로드 시 계산) */
-    size_t ws_fixed;       /* int8 가중치를 풀어 쓴 사본의 float 수 합 (큰 배치에서만 할당, 조각 계산에서 먼저 뺌) */
+    size_t ws_fixed;       /* 배치와 무관한 작업 버퍼 float 수: int8 가중치를 풀어 쓴 사본(큰 배치에서만) + 공유 im2col 상한. 조각 계산에서 먼저 뺌 */
     int n_vals;            /* n_steps + 1 */
     int out_v;             /* 모델 출력 값 번호 */
     kernix_val* vals;
@@ -262,6 +262,7 @@ typedef struct kernix_model {
     int in_nd, in_shape[KERNIX_MAX_DIMS];   /* 표본 하나의 입력 모양 (channels-last) */
     int out_nd, out_shape[KERNIX_MAX_DIMS]; /* 표본 하나의 출력 모양 (channels-last) */
     int layout;            /* 0 = channels-last, 1 = PyTorch channels-first 입력 (바인딩이 축을 옮김) */
+    float_tensor* col;     /* 합성곱 im2col 버퍼: 합성곱은 한 번에 하나씩 돌므로 모두 공유 (크기는 조각 단위라 배치와 무관) */
 } kernix_model;
 
 enum { KERNIX_SHAPE_COUNT, KERNIX_SHAPE_ALLOC, KERNIX_SHAPE_VIEW };
@@ -275,6 +276,8 @@ static inline void kernix_model_release(kernix_model* m)
     m->batch = -1;
     float_free(m->out_all);
     m->out_all = NULL;
+    float_free(m->col);
+    m->col = NULL;
     for (int k = 0; m->st != NULL && k < m->n_st; k++) {
         float_free(m->st[k]);
         m->st[k] = NULL;
@@ -592,25 +595,41 @@ static inline void kernix_hw(const kernix_val* v, int* H, int* W)
     *W = v->nd == 3 ? v->d[1] : 1;
 }
 
-/* 출력 행 (b, oy, ox)마다 커널 창의 입력 채널 [c0, c0+cg)를 (ky, kx, c) 순서로 펼침. 범위 밖(패딩)은 0 */
-static inline void kernix_im2col(const kernix_step* s, const float* x, float* col, size_t B, int H, int W, int C,
+/* 합성곱은 출력 행을 조각으로 나눠, 갈래(KERNIX_CONV_SLOTS개)마다 자기 버퍼에 im2col → sgemm → bias·act를 차례로 함.
+ * 펼친 행렬 전체가 메모리를 왕복하지 않고(조각은 캐시에 남음), 한 갈래가 펼치는 동안 다른 갈래의 sgemm이 AMX를 씀.
+ * M1 측정 (ResNet 32채널 3×3, 입력 3×32×32): 배치 1 0.60 → 0.47 ms, 배치 64 39 → 22 ms.
+ * 조각 2^19 float(2 MB)와 4갈래가 가장 빨랐음 (8갈래는 효율 코어까지 써서 느림). 다른 칩이면 다시 잴 것 */
+#define KERNIX_CONV_TILE ((size_t)1 << 19)
+#define KERNIX_CONV_SLOTS 4
+#define KERNIX_CONV_MIN_SPLIT 256 /* 출력 행이 이 이상이면 조각이 하나뿐이어도 갈래 수만큼 나눔 */
+
+/* 출력 rows행을 조각으로 나눌 때 조각 하나의 행 수 */
+static inline size_t kernix_conv_tile_rows(size_t K, size_t rows)
+{
+    size_t t = KERNIX_CONV_TILE / (K ? K : 1);
+    const size_t even = (rows + KERNIX_CONV_SLOTS - 1) / KERNIX_CONV_SLOTS;
+    if (rows >= KERNIX_CONV_MIN_SPLIT && even < t) t = even;
+    return t < 1 ? 1 : t < rows ? t : rows;
+}
+
+/* 출력 행 [r0, r1)의 (b, oy, ox)마다 커널 창의 입력 채널 [c0, c0+cg)를 (ky, kx, c) 순서로 col에 펼침. 범위 밖(패딩)은 0.
+ * 직렬 (갈래가 병렬). 복사는 반복문: 채널이 적으면(cg = 3이면 12바이트) memcpy 호출 비용이 복사보다 큼 */
+static inline void kernix_im2col(const kernix_step* s, const float* x, float* col, size_t r0, size_t r1, int H, int W, int C,
                                  int c0, int cg, int Ho, int Wo)
 {
     const size_t K = (size_t)s->kh * (size_t)s->kw * (size_t)cg;
-    kernix_par(B * (size_t)Ho * (size_t)Wo, K, ^(size_t r0, size_t nr) {
-        for (size_t r = r0; r < r0 + nr; r++) {
-            const size_t b = r / ((size_t)Ho * Wo), oy = (r / Wo) % Ho, ox = r % Wo;
-            float* o = col + r * K;
-            for (int ky = 0; ky < s->kh; ky++) {
-                const long iy = (long)oy * s->sh - s->pt + (long)ky * s->dh;
-                for (int kx = 0; kx < s->kw; kx++, o += cg) {
-                    const long ix = (long)ox * s->sw - s->pl + (long)kx * s->dw;
-                    if (iy < 0 || iy >= H || ix < 0 || ix >= W) memset(o, 0, sizeof(float) * cg);
-                    else memcpy(o, x + (((size_t)b * H + iy) * W + ix) * C + c0, sizeof(float) * cg);
-                }
+    for (size_t r = r0; r < r1; r++) {
+        const size_t b = r / ((size_t)Ho * Wo), oy = (r / Wo) % Ho, ox = r % Wo;
+        float* o = col + (r - r0) * K;
+        for (int ky = 0; ky < s->kh; ky++) {
+            const long iy = (long)oy * s->sh - s->pt + (long)ky * s->dh;
+            for (int kx = 0; kx < s->kw; kx++, o += cg) {
+                const long ix = (long)ox * s->sw - s->pl + (long)kx * s->dw;
+                if (iy < 0 || iy >= H || ix < 0 || ix >= W) for (int c = 0; c < cg; c++) o[c] = 0.0f;
+                else { const float* src = x + (((size_t)b * H + iy) * W + ix) * C + c0; for (int c = 0; c < cg; c++) o[c] = src[c]; }
             }
         }
-    });
+    }
 }
 
 static inline int kernix_conv_pointwise(const kernix_step* s)
@@ -618,10 +637,19 @@ static inline int kernix_conv_pointwise(const kernix_step* s)
     return s->kh == 1 && s->kw == 1 && s->sh == 1 && s->sw == 1 && s->pt == 0 && s->pb == 0 && s->pl == 0 && s->pr == 0;
 }
 
-/* groups == 1: im2col + 행렬곱 하나 (1×1 보폭 1은 입력을 그대로). 깊이별(groups == cin): 채널 방향 벡터 곱-합.
- * 그 밖의 groups: 그룹마다 im2col + sgemm을 출력 열 위치에 바로 씀 */
+/* 1×1 보폭 1 (groups == 1): 입력을 그대로 행렬곱. 깊이별(groups == cin): 채널 방향 벡터 곱-합.
+ * 그 밖: 조각마다 (그룹마다 im2col + sgemm을 출력 열 위치에 바로) → bias·act, 조각은 갈래로 병렬 (KERNIX_CONV_TILE 참고) */
+/* 이 합성곱이 im2col을 쓰면 펼친 행 길이 K, 아니면 0 (1×1 보폭 1, 깊이별) */
+static inline size_t kernix_conv_K(const kernix_step* s)
+{
+    const int cg = s->in / s->groups;
+    if ((s->groups == 1 && kernix_conv_pointwise(s)) || (s->groups > 1 && cg == 1)) return 0;
+    return (size_t)s->kh * s->kw * cg;
+}
+
+/* col0: 모델의 공유 im2col 버퍼 (KERNIX_CONV_SLOTS × 조각 행 수 × K 이상) */
 static inline int kernix_conv_run(const kernix_step* s, const kernix_val* vi, const float_tensor* x,
-                                  const kernix_val* vo, float_tensor* y)
+                                  const kernix_val* vo, float_tensor* y, float* col0)
 {
     int H, W, Ho, Wo;
     kernix_hw(vi, &H, &W);
@@ -634,12 +662,8 @@ static inline int kernix_conv_run(const kernix_step* s, const kernix_val* vi, co
     const int act = s->act;
     const float alpha = s->alpha;
     float* o = y->tensor;
-    if (g == 1) {
-        if (kernix_conv_pointwise(s)) return kernix_dense(x, s->w, y, bias, act, alpha);
-        kernix_im2col(s, x->tensor, s->tmp[0]->tensor, B, H, W, C, 0, C, Ho, Wo);
-        return kernix_dense(s->tmp[0], s->w, y, bias, act, alpha);
-    }
-    if (cg == 1) { /* 깊이별: 출력 채널 c·mult + m은 입력 채널 c에서 */
+    if (g == 1 && kernix_conv_pointwise(s)) return kernix_dense(x, s->w, y, bias, act, alpha);
+    if (g > 1 && cg == 1) { /* 깊이별: 출력 채널 c·mult + m은 입력 채널 c에서 */
         const int mult = Co / C;
         const float* w = s->w->tensor;
         const float* xin = x->tensor;
@@ -666,13 +690,23 @@ static inline int kernix_conv_run(const kernix_step* s, const kernix_val* vi, co
         });
         return 0;
     }
-    float* col = s->tmp[0]->tensor;
-    for (int gi = 0; gi < g; gi++) {
-        kernix_im2col(s, x->tensor, col, B, H, W, C, gi * cg, cg, Ho, Wo);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)rows, cog, (int)K,
-                    1.0f, col, (int)K, s->w->tensor + (size_t)gi * cog, Co, 0.0f, o + (size_t)gi * cog, Co);
-    }
-    kernix_bias_act(o, rows, (size_t)Co, bias, act, alpha);
+    /* 조각 행렬곱은 GPU 분할 기준(2²⁸) 아래라 AMX만 씀. M1에서 큰 배치도 GPU+AMX 분할보다 빠름 */
+    const size_t T = kernix_conv_tile_rows(K, rows), n_tiles = (rows + T - 1) / T;
+    const size_t slots = n_tiles < KERNIX_CONV_SLOTS ? n_tiles : KERNIX_CONV_SLOTS;
+    const float* xin = x->tensor;
+    const float* wt = s->w->tensor;
+    dispatch_apply(slots, DISPATCH_APPLY_AUTO, ^(size_t sl) {
+        float* col = col0 + sl * T * K; /* 갈래마다 자기 im2col 버퍼 */
+        for (size_t t = sl; t < n_tiles; t += slots) {
+            const size_t r0 = t * T, r1 = rows - r0 < T ? rows : r0 + T;
+            for (int gi = 0; gi < g; gi++) {
+                kernix_im2col(s, xin, col, r0, r1, H, W, C, gi * cg, cg, Ho, Wo);
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, (int)(r1 - r0), cog, (int)K,
+                            1.0f, col, (int)K, wt + (size_t)gi * cog, Co, 0.0f, o + r0 * Co + (size_t)gi * cog, Co);
+            }
+            kernix_bias_act(o + r0 * Co, r1 - r0, (size_t)Co, bias, act, alpha); /* 조각이 캐시에 있을 때 */
+        }
+    });
     return 0;
 }
 
@@ -1481,10 +1515,16 @@ static inline kernix_model* kernix_model_load(const char* path)
     if ((m->ws_per_sample = kernix_model_shape(m, m->seq_len, KERNIX_SHAPE_COUNT)) == KERNIX_SHAPE_FAIL) {
         err = "작업 버퍼 크기가 범위 밖"; goto fail;
     }
+    size_t col_max = 0; /* 공유 im2col 버퍼의 상한: 갈래 수 × max(조각, K) */
     for (int i = 0; i < m->n_steps; i++) {
         if (m->steps[i].q != NULL) m->ws_fixed += (size_t)m->steps[i].q->k * (size_t)m->steps[i].q->n;
         if (m->steps[i].q_b != NULL) m->ws_fixed += (size_t)m->steps[i].q_b->k * (size_t)m->steps[i].q_b->n;
+        if (m->steps[i].kind == KERNIX_OP_CONV) {
+            const size_t K = kernix_conv_K(&m->steps[i]), c = KERNIX_CONV_SLOTS * (K > KERNIX_CONV_TILE ? K : KERNIX_CONV_TILE);
+            if (K > 0 && c > col_max) col_max = c;
+        }
     }
+    m->ws_fixed += col_max;
     free(cons);
     free(map);
     fclose(f);
@@ -1524,7 +1564,7 @@ static inline int kernix_ws_deq(const kernix_qweight* q, float_tensor** deq, siz
 /* 입력 rows행일 때의 모든 작업 버퍼에 mode를 적용. 반환: 작업 버퍼 float 수 (0행이면 0), 실패 시 KERNIX_SHAPE_FAIL */
 static inline size_t kernix_model_shape(kernix_model* m, int rows, int mode)
 {
-    size_t n = 0;
+    size_t n = 0, col = 0; /* col: 공유 im2col 버퍼에 필요한 float 수 (합성곱 중 최댓값) */
     const size_t B = (size_t)rows / (size_t)m->seq_len;
     for (int k = 0; k < m->n_st; k++)
         if (kernix_ws(&m->st[k], B, m->st_cap[k], mode, &n) != 0) return KERNIX_SHAPE_FAIL;
@@ -1551,10 +1591,9 @@ static inline size_t kernix_model_shape(kernix_model* m, int rows, int mode)
                 return KERNIX_SHAPE_FAIL;
             break;
         }
-        case KERNIX_OP_CONV: {
-            const int cg = s->in / s->groups;
-            if (((s->groups == 1 && !kernix_conv_pointwise(s)) || (s->groups > 1 && cg > 1)) &&
-                kernix_ws(&s->tmp[0], rout, (size_t)s->kh * s->kw * cg, mode, &n) != 0) return KERNIX_SHAPE_FAIL;
+        case KERNIX_OP_CONV: { /* im2col은 갈래마다 조각 하나 (kernix_conv_run과 같은 조각 크기) */
+            const size_t K = kernix_conv_K(s), need = KERNIX_CONV_SLOTS * kernix_conv_tile_rows(K, rout) * K;
+            if (need > col) col = need;
             break;
         }
         case KERNIX_OP_ATTENTION: {
@@ -1569,6 +1608,9 @@ static inline size_t kernix_model_shape(kernix_model* m, int rows, int mode)
             break;
         }
     }
+    /* 공유 im2col 버퍼는 배치와 무관한 고정분이라 COUNT(표본당 크기)에 넣지 않음: 로드에서 ws_fixed로 셈 */
+    if (col > INT_MAX) return KERNIX_SHAPE_FAIL;
+    if (mode == KERNIX_SHAPE_ALLOC && col > 0 && (m->col = kernix_float_new(1, (int)col, 0)) == NULL) return KERNIX_SHAPE_FAIL;
     return n;
 }
 
@@ -1629,7 +1671,7 @@ static inline const float_tensor* kernix_model_run(kernix_model* m, const float_
         case KERNIX_OP_LAYERNORM: kernix_layer_norm_rows_into(a->tensor, y->tensor, rows, cols, s->gamma, s->beta, s->eps); break;
         case KERNIX_OP_SOFTMAX: floats_softmax_into(a->tensor, y->tensor, rows, cols); break;
         case KERNIX_OP_CONV:
-            if (kernix_conv_run(s, vi, a, vo, y) != 0) return NULL;
+            if (kernix_conv_run(s, vi, a, vo, y, m->col != NULL ? m->col->tensor : NULL) != 0) return NULL;
             break;
         case KERNIX_OP_POOL: kernix_pooling_run(s, vi, a, vo, y); break;
         case KERNIX_OP_GLOBAL_POOL: kernix_global_pool_run(s, vi, a, y); break;
