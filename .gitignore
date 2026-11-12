@@ -1,0 +1,76 @@
+# Python virtual environments
+venv/
+.venv/
+
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo
+
+# macOS
+.DS_Store
+
+# Build outputs
+build/
+
+# 공개하지 않음: 테스트·벤치(로컬 전용), 개인 메모, 작업 계획, 수어 프로젝트 전용 문서
+test/
+info.md
+README.ko.md
+docs/superpowers/
+docs/sign-model-kernix-test.md
+*.swp
+
+# Python
+__pycache__/
