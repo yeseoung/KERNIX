@@ -343,6 +343,14 @@ static inline void kernix_model_release(kernix_model* m)
 static inline void kernix_model_trim(kernix_model* m)
 {
     kernix_model_release(m);
+#if defined(KERNIX_USE_COREML) /* Core ML 모델도 해제하고 결정 표는 남김: ANE로 결정된 크기가 다시 오면 뒤에서 다시 컴파일 */
+    for (int k = 0; m != NULL && k < m->n_seg; k++) {
+        kernix_coreml_release(m->seg[k].ml);
+        m->seg[k].ml = NULL;
+        m->seg[k].ml_batch = 0;
+        m->seg[k].warm = m->seg[k].an = 0;
+    }
+#endif
 #if defined(KERNIX_USE_METAL)
     kernix_metal_release_cache();
 #endif
@@ -359,6 +367,11 @@ static inline void kernix_step_free(kernix_step* s)
 static inline void kernix_model_free(kernix_model* m)
 {
     if (m == NULL) return;
+#if defined(KERNIX_USE_COREML) /* 뒤 컴파일이 이 모델의 가중치를 읽으므로 끝나기를 먼저 기다림 */
+    kernix_coreml_ctx_free(m->coreml);
+    m->coreml = NULL;
+    for (int k = 0; k < m->n_seg; k++) kernix_coreml_release(m->seg[k].ml);
+#endif
     kernix_model_release(m);
     for (int i = 0; m->steps != NULL && i < m->n_steps; i++) kernix_step_free(&m->steps[i]);
     free(m->steps);
