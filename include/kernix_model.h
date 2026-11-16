@@ -240,6 +240,18 @@ typedef struct {
 #define KERNIX_WORKSPACE_LIMIT ((size_t)64 << 20)
 #endif
 
+/* ANE 보조 구간 (docs/superpowers/specs/2026-11-16-ane-assist-design.md): 연속한 단계 [first, last]를 Core ML 모델 하나로
+ * 뉴럴엔진에서 실행. 구간 밖에서 읽는 값은 in_v 하나, 구간 밖으로 나가는 값은 out_v 하나 */
+typedef struct kernix_ane_seg {
+    int first, last, in_v, out_v;
+    void* ml;       /* Core ML 모델 (kernix_coreml_*), 없으면 NULL */
+    int ml_batch;   /* ml의 고정 표본 수, 없으면 0 */
+    int broken;     /* 컴파일·예측 실패: 이후 KERNIX 경로만 */
+    int compiles, ane_runs, failures;
+} kernix_ane_seg;
+
+typedef struct { int segments, compiles, ane_runs, failures; } kernix_ane_info;
+
 typedef struct kernix_model {
     int n_steps;
     int in_dim, out_dim;   /* 입력 채널 수, 표본당 출력 float 수 */
@@ -263,7 +275,18 @@ typedef struct kernix_model {
     int out_nd, out_shape[KERNIX_MAX_DIMS]; /* 표본 하나의 출력 모양 (channels-last) */
     int layout;            /* 0 = channels-last, 1 = PyTorch channels-first 입력 (바인딩이 축을 옮김) */
     float_tensor* col;     /* 합성곱 im2col 버퍼: 합성곱은 한 번에 하나씩 돌므로 모두 공유 (크기는 조각 단위라 배치와 무관) */
+    int ane;               /* 1 = ANE 보조 켜짐 (kernix_model_set_ane) */
+    int n_seg;
+    kernix_ane_seg* seg;
+    int* seg_start;        /* 단계마다 그 단계에서 시작하는 구간 번호, 없으면 -1. NULL = 아직 구간을 찾지 않음 */
+    void* coreml;          /* 뒤 컴파일 큐 (kernix_coreml_ctx_*) */
 } kernix_model;
+
+#if defined(KERNIX_USE_COREML) /* src/kernix_coreml.m */
+int kernix_coreml_available(void); /* macOS 13 이상이면 1 */
+/* 이 단계를 Core ML 층으로 표현할 수 있으면 1 (in: 첫 입력 값, out: 출력 값) */
+int kernix_coreml_step_ok(const kernix_step* s, const kernix_val* in, const kernix_val* out);
+#endif
 
 enum { KERNIX_SHAPE_COUNT, KERNIX_SHAPE_ALLOC, KERNIX_SHAPE_VIEW };
 #define KERNIX_SHAPE_FAIL ((size_t)-1)
@@ -321,6 +344,8 @@ static inline void kernix_model_free(kernix_model* m)
     free(m->views);
     free(m->st_cap);
     free(m->st);
+    free(m->seg);
+    free(m->seg_start);
     free(m);
 }
 
@@ -1631,6 +1656,152 @@ static inline int kernix_model_alloc(kernix_model* m, int rows)
 static inline void kernix_model_set_workspace_limit(kernix_model* m, size_t bytes)
 {
     if (m != NULL) m->ws_limit = bytes;
+}
+
+/* ---- ANE 보조: 구간 찾기 ---- */
+/* 크기가 1보다 큰 축이 하나 이하인 값: Reshape·Permute를 해도 메모리 순서가 그대로 */
+static inline int kernix_val_flat(const kernix_val* v)
+{
+    int big = 0;
+    for (int k = 0; k < v->nd; k++) big += v->d[k] > 1;
+    return big <= 1;
+}
+
+/* Core ML 쪽에서 데이터를 옮기지 않는 단계 (입력 값의 별칭) */
+static inline int kernix_ane_is_view(int kind) { return kind == KERNIX_OP_RESHAPE || kind == KERNIX_OP_PERMUTE; }
+
+/* 단계 i를 Core ML 구간에 넣을 수 있는지 */
+static inline int kernix_ane_step_ok(const kernix_model* m, int i)
+{
+    const kernix_step* s = &m->steps[i];
+    const kernix_val* vo = &m->vals[i + 1];
+    switch (s->kind) {
+    case KERNIX_OP_CONV: case KERNIX_OP_POOL: case KERNIX_OP_GLOBAL_POOL: case KERNIX_OP_AFFINE: case KERNIX_OP_ACT:
+    case KERNIX_OP_BINARY: case KERNIX_OP_LINEAR: case KERNIX_OP_PAD: case KERNIX_OP_UPSAMPLE:
+        break;
+    case KERNIX_OP_CONCAT:
+        if (s->axis != KERNIX_AXIS_LAST) return 0;
+        break;
+    case KERNIX_OP_RESHAPE: /* 벡터끼리만: NHWC와 NCHW는 펼침 순서가 달라 이미지의 Reshape은 Core ML에서 다른 결과 */
+    case KERNIX_OP_PERMUTE: /* PyTorch 내보내기의 (C,) → (C,1,1) → (1,1,C) 같은 크기 1 축 옮기기 */
+        return kernix_val_flat(&m->vals[s->inp[0]]) && kernix_val_flat(vo);
+    default:
+        return 0;
+    }
+    if (vo->nd > 3) return 0;
+    for (int k = 0; k < s->n_in; k++) {
+        const int v = s->inp[k];
+        if (m->vals[v].nd > 3) return 0;
+        /* 별칭 값은 Core ML에서 원래 값의 모양(벡터면 C×1×1)을 가지므로, 행이 여러 개인 모양으로 바뀐 별칭은 계산 단계에 못 줌 */
+        if (v > 0 && kernix_ane_is_view(m->steps[v - 1].kind) && m->vals[v].r != 1) return 0;
+    }
+#if defined(KERNIX_USE_COREML)
+    return kernix_coreml_step_ok(s, &m->vals[s->inp[0]], vo);
+#else
+    return 0;
+#endif
+}
+
+/* [a, b]가 구간이 될 수 있으면 1: 구간 앞의 값 중 안에서 읽는 것이 하나, 안에서 만든 값 중 밖에서 읽는 것이 하나, CONV 포함 */
+static inline int kernix_ane_seg_ok(const kernix_model* m, int a, int b, int* in_v, int* out_v)
+{
+    int iv = -1, ov = -1, conv = 0;
+    for (int i = a; i <= b; i++) {
+        const kernix_step* s = &m->steps[i];
+        conv |= s->kind == KERNIX_OP_CONV;
+        for (int k = 0; k < s->n_in; k++) {
+            const int v = s->inp[k];
+            if (v > a) continue; /* 값 v는 단계 v-1의 출력: v ≤ a면 구간 앞에서 만든 값 */
+            if (iv >= 0 && iv != v) return 0;
+            iv = v;
+        }
+        if (m->vals[i + 1].last > b) {
+            if (ov >= 0) return 0;
+            ov = i + 1;
+        }
+    }
+    if (!conv || iv < 0 || ov < 0) return 0;
+    *in_v = iv;
+    *out_v = ov;
+    return 1;
+}
+
+/* 저장 버퍼 배치를 다시 계산 (값의 수명을 바꾼 뒤). 작업 버퍼는 해제되고 다음 forward가 다시 할당 */
+static inline int kernix_replan(kernix_model* m)
+{
+    kernix_model_release(m);
+    free(m->st_cap);
+    free(m->st);
+    m->st_cap = NULL;
+    m->st = NULL;
+    m->n_st = 0;
+    if (kernix_plan(m) != 0) return -1;
+    const size_t w = kernix_model_shape(m, m->seq_len, KERNIX_SHAPE_COUNT);
+    if (w == KERNIX_SHAPE_FAIL) return -1;
+    m->ws_per_sample = w;
+    return 0;
+}
+
+/* 구간을 찾고, 구간 입력과 출력이 같은 저장 버퍼를 쓰지 않게 버퍼를 다시 배치 (Core ML이 같은 메모리를 읽고 쓰면 안 됨) */
+static inline int kernix_ane_find(kernix_model* m)
+{
+    const int n = m->n_steps;
+    m->seg_start = malloc(sizeof(int) * (size_t)n);
+    m->seg = calloc((size_t)n, sizeof(kernix_ane_seg));
+    if (m->seg_start == NULL || m->seg == NULL) return -1;
+    for (int i = 0; i < n; i++) m->seg_start[i] = -1;
+    for (int a = 0; a < n;) {
+        if (!kernix_ane_step_ok(m, a)) { a++; continue; }
+        int end = a;
+        while (end + 1 < n && kernix_ane_step_ok(m, end + 1)) end++;
+        int b = end, iv = -1, ov = -1;
+        while (b >= a && !kernix_ane_seg_ok(m, a, b, &iv, &ov)) b--; /* 가장 긴 구간부터 */
+        if (b < a) { a++; continue; }
+        m->seg[m->n_seg++] = (kernix_ane_seg){ .first = a, .last = b, .in_v = iv, .out_v = ov };
+        a = b + 1;
+    }
+    /* 구간 입력을 구간 끝 다음까지 살려 둠: 구간 안의 어떤 단계도 그 버퍼에 쓰지 못함 */
+    for (int k = 0; k < m->n_seg; k++)
+        if (m->vals[m->seg[k].in_v].last < m->seg[k].last + 1) m->vals[m->seg[k].in_v].last = m->seg[k].last + 1;
+    if (m->n_seg > 0 && kernix_replan(m) != 0) return -1;
+    int kept = 0;
+    for (int k = 0; k < m->n_seg; k++) {
+        const kernix_ane_seg* g = &m->seg[k];
+        if (m->vals[g->in_v].st == m->vals[g->out_v].st) continue; /* Reshape 보기 등으로 같은 버퍼면 버림 */
+        m->seg[kept] = *g;
+        m->seg_start[g->first] = kept++;
+    }
+    m->n_seg = kept;
+    return 0;
+}
+
+/* ANE 보조를 켜거나(on = 1) 끔. 켜면 첫 호출에서 구간을 찾고 버퍼를 다시 배치.
+ * 성공 0. 이 빌드(-DKERNIX_USE_COREML 없음)나 OS(macOS 13 미만)에서 못 쓰거나 메모리가 부족하면 -1이고, 모델은 KERNIX 경로로 동작 */
+static inline int kernix_model_set_ane(kernix_model* m, int on)
+{
+    if (m == NULL) return -1;
+    if (!on) { m->ane = 0; return 0; }
+#if defined(KERNIX_USE_COREML)
+    if (!kernix_coreml_available()) return -1;
+    /* shortcut: 버퍼 재배치 중 메모리 부족이면 모델을 다시 불러와야 함, 실제로 보이면 이전 배치로 되돌리는 코드 추가 */
+    if (m->seg_start == NULL && kernix_ane_find(m) != 0) return -1;
+    m->ane = 1;
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+static inline void kernix_model_ane_info(const kernix_model* m, kernix_ane_info* out)
+{
+    *out = (kernix_ane_info){ 0 };
+    if (m == NULL) return;
+    out->segments = m->n_seg;
+    for (int k = 0; k < m->n_seg; k++) {
+        out->compiles += m->seg[k].compiles;
+        out->ane_runs += m->seg[k].ane_runs;
+        out->failures += m->seg[k].failures;
+    }
 }
 
 /* 작업 버퍼가 x->row행에 맞춰져 있을 때 모든 단계를 한 번 실행 */

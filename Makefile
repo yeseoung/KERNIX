@@ -6,6 +6,8 @@ ACCEL_FLAGS = -DKERNIX_USE_ACCELERATE -framework Accelerate
 # kernix.h를 쓰는 모든 소스에 -DKERNIX_USE_METAL을 줘야 함 (float_free가 Metal 할당을 알아야 함)
 METAL_FLAGS = $(ACCEL_FLAGS) -DKERNIX_USE_METAL -fobjc-arc src/kernix_metal.m \
               -framework Metal -framework MetalPerformanceShaders -framework Foundation
+# ANE 보조 (Core ML): kernix_model.h를 쓰는 모든 소스에 -DKERNIX_USE_COREML (src/kernix_coreml.m, macOS 13 이상에서 동작)
+COREML_FLAGS = -DKERNIX_USE_COREML -fobjc-arc src/kernix_coreml.m -framework CoreML -framework Foundation
 
 .PHONY: all lib python-lib clean
 
@@ -14,7 +16,7 @@ all: lib python-lib
 # 설치용 정적 라이브러리 (install_mac.sh가 씀). libkernix.a: 스레드 풀 (모든 빌드),
 # libkernix_metal.a: Metal 코드 (-DKERNIX_USE_METAL 빌드만, Metal·MPS·Foundation 프레임워크와 같이 링크)
 LIB_CFLAGS = -O3 -Wall -Wextra -I./include -mcpu=apple-m1
-lib: build/libkernix.a build/libkernix_metal.a
+lib: build/libkernix.a build/libkernix_metal.a build/libkernix_coreml.a
 
 build/libkernix.a: src/kernix_runtime.c include/kernix.h
 	@mkdir -p build
@@ -26,9 +28,16 @@ build/libkernix_metal.a: src/kernix_metal.m include/kernix.h
 	$(CC) $(LIB_CFLAGS) -DKERNIX_USE_ACCELERATE -DKERNIX_USE_METAL -fobjc-arc -c src/kernix_metal.m -o build/kernix_metal.o
 	rm -f $@ && ar rcs $@ build/kernix_metal.o
 
-# Python 바인딩용 공유 라이브러리 (python/kernix.py가 로드). 웹캠 추론 같은 작은 배치는 GPU를 안 쓰므로 Accelerate만
-python-lib: src/kernix_capi.c include/kernix.h include/kernix_model.h
-	$(CC) $(CFLAGS) $(ACCEL_FLAGS) -dynamiclib src/kernix_capi.c -o python/libkernix.dylib
+# libkernix_coreml.a: ANE 보조 (-DKERNIX_USE_COREML 빌드만, CoreML·Foundation 프레임워크와 같이 링크)
+build/libkernix_coreml.a: src/kernix_coreml.m include/kernix.h include/kernix_model.h
+	@mkdir -p build
+	$(CC) $(LIB_CFLAGS) -DKERNIX_USE_ACCELERATE -DKERNIX_USE_COREML -fobjc-arc -c src/kernix_coreml.m -o build/kernix_coreml.o
+	rm -f $@ && ar rcs $@ build/kernix_coreml.o
+
+# Python 바인딩용 공유 라이브러리 (python/kernix.py가 로드). 웹캠 추론 같은 작은 배치는 GPU를 안 쓰므로 Accelerate만,
+# ANE 보조(Model(path, ane=True))를 위해 Core ML을 같이 넣음 (꺼져 있으면 Core ML 코드를 타지 않음)
+python-lib: src/kernix_capi.c src/kernix_coreml.m include/kernix.h include/kernix_model.h
+	$(CC) $(CFLAGS) $(ACCEL_FLAGS) $(COREML_FLAGS) -dynamiclib src/kernix_capi.c -o python/libkernix.dylib
 
 clean::
 	rm -rf build python/libkernix.dylib python/__pycache__

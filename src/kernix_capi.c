@@ -31,6 +31,17 @@ KERNIX_API int kernix_capi_forward(kernix_model* m, const float* x, int rows, fl
     return 0;
 }
 
+/* ANE 보조 켜기/끄기. 성공 0, 이 빌드·OS에서 못 쓰면 -1 (모델은 그대로 동작) */
+KERNIX_API int kernix_capi_set_ane(kernix_model* m, int on) { return kernix_model_set_ane(m, on); }
+
+/* out: segments, compiles, ane_runs, failures */
+KERNIX_API void kernix_capi_ane_info(const kernix_model* m, int* out)
+{
+    kernix_ane_info i;
+    kernix_model_ane_info(m, &i);
+    out[0] = i.segments; out[1] = i.compiles; out[2] = i.ane_runs; out[3] = i.failures;
+}
+
 /* 표본 하나의 입력·출력 모양 (channels-last, 축 수 ≤ 4)과 입력 layout (0 = channels-last, 1 = PyTorch channels-first) */
 KERNIX_API void kernix_capi_shapes(const kernix_model* m, int* in_nd, int* in_shape, int* out_nd, int* out_shape, int* layout)
 {
