@@ -286,6 +286,10 @@ typedef struct kernix_model {
 int kernix_coreml_available(void); /* macOS 13 이상이면 1 */
 /* 이 단계를 Core ML 층으로 표현할 수 있으면 1 (in: 첫 입력 값, out: 출력 값) */
 int kernix_coreml_step_ok(const kernix_step* s, const kernix_val* in, const kernix_val* out);
+struct kernix_model;
+/* 구간 seg를 표본 batch개 고정의 NeuralNetwork .mlmodel로 path에 씀. 입력 "x"·출력 "y"는 KERNIX 버퍼 모양 (batch, H, W, C).
+ * 성공 0, 실패 -1 */
+int kernix_coreml_write_spec(const struct kernix_model* m, int seg, int batch, const char* path);
 #endif
 
 enum { KERNIX_SHAPE_COUNT, KERNIX_SHAPE_ALLOC, KERNIX_SHAPE_VIEW };

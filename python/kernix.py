@@ -36,6 +36,8 @@ _lib.kernix_capi_set_ane.argtypes = [ctypes.c_void_p, ctypes.c_int]
 _lib.kernix_capi_set_ane.restype = ctypes.c_int
 _lib.kernix_capi_ane_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
 _lib.kernix_capi_ane_info.restype = None
+_lib.kernix_capi_ane_dump.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+_lib.kernix_capi_ane_dump.restype = ctypes.c_int
 
 
 class Model:
@@ -93,6 +95,11 @@ class Model:
         with self._lock:
             _lib.kernix_capi_ane_info(self._h, out)
         return dict(zip(("segments", "compiles", "ane_runs", "failures"), out))
+
+    def _ane_dump(self, seg, batch, path):
+        """테스트용: 구간 seg를 표본 batch개 고정의 Core ML 모델(.mlmodel)로 path에 씀. 성공 0, 실패 -1"""
+        with self._lock:
+            return _lib.kernix_capi_ane_dump(self._h, seg, batch, os.fsencode(path))
 
     def trim(self):
         """작업 버퍼를 운영체제에 돌려준다 (가중치는 유지). 큰 배치 뒤 쉬는 동안 부르면 좋고, 다음 호출이 다시 할당"""

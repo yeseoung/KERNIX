@@ -42,6 +42,17 @@ KERNIX_API void kernix_capi_ane_info(const kernix_model* m, int* out)
     out[0] = i.segments; out[1] = i.compiles; out[2] = i.ane_runs; out[3] = i.failures;
 }
 
+/* 테스트용: 구간 seg를 표본 batch개의 Core ML 모델로 path에 씀. 성공 0, 실패(또는 Core ML 없는 빌드) -1 */
+KERNIX_API int kernix_capi_ane_dump(const kernix_model* m, int seg, int batch, const char* path)
+{
+#if defined(KERNIX_USE_COREML)
+    return kernix_coreml_write_spec(m, seg, batch, path);
+#else
+    (void)m; (void)seg; (void)batch; (void)path;
+    return -1;
+#endif
+}
+
 /* 표본 하나의 입력·출력 모양 (channels-last, 축 수 ≤ 4)과 입력 layout (0 = channels-last, 1 = PyTorch channels-first) */
 KERNIX_API void kernix_capi_shapes(const kernix_model* m, int* in_nd, int* in_shape, int* out_nd, int* out_shape, int* layout)
 {
