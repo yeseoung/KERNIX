@@ -23,6 +23,7 @@
 |---|---|
 | **Model inference runtime** (`include/kernix_model.h`) | Loads and runs `.knx` models, including graph models with convolutions, RNNs, attention, and residual connections. No allocation during forward when the batch size is unchanged; large batches run in chunks under a workspace limit (64 MB by default) |
 | **Model export** (`tools/`) | Converts Keras (`.h5`, Sequential and functional) and PyTorch (models saved with `torch.save`, traced with `torch.fx`) to `.knx`. BatchNorm and Normalization are folded into the preceding layer's weights |
+| **Neural Engine assist** (`src/kernix_coreml.m`) | `Model(path, ane=True)`: convolutional parts of the graph run on the Neural Engine through Core ML models that KERNIX builds at run time from the `.knx`. Output still comes from KERNIX; compiles happen in the background and each part keeps whichever path is measured faster. Off by default (float16, about 1e-3 error) |
 | **int8 quantization** | `--quantize int8`: files about 3.5× smaller, NEON `sdot` int8 matmul for small sample counts |
 | **Python binding** (`python/kernix.py`) | One line: `Model(path)(x)`. Needs only numpy. Each model has a lock, so calling it from several threads is safe |
 | **Concurrent GPU + AMX matmul** | The GPU (MPS) and AMX compute different rows of the same output buffer at the same time. The split ratio is calibrated automatically per size bucket. Bias and activation run on the GPU for GPU rows and on the CPU for CPU rows |
@@ -57,6 +58,7 @@ PREFIX=~/.local ./install_mac.sh   # install somewhere else
 | `kernix.h`, `kernix_model.h` | `$PREFIX/include` | Tensor ops, model runtime (header-only) |
 | `libkernix.a` | `$PREFIX/lib` | Thread pool: required by every build |
 | `libkernix_metal.a` | `$PREFIX/lib` | Metal GPU code: only for `-DKERNIX_USE_METAL` builds |
+| `libkernix_coreml.a` | `$PREFIX/lib` | Neural Engine assist (Core ML): only for `-DKERNIX_USE_COREML` builds |
 
 After installing, build like this:
 
@@ -67,6 +69,10 @@ clang -O3 -std=c11 -DKERNIX_USE_ACCELERATE app.c -lkernix -framework Accelerate 
 # CPU + AMX + GPU (Metal): pass -DKERNIX_USE_METAL to every source that includes kernix.h
 clang -O3 -std=c11 -DKERNIX_USE_ACCELERATE -DKERNIX_USE_METAL app.c -lkernix -lkernix_metal \
       -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation -o app
+
+# + Neural Engine assist: pass -DKERNIX_USE_COREML to every source that includes kernix_model.h
+clang -O3 -std=c11 -DKERNIX_USE_ACCELERATE -DKERNIX_USE_COREML app.c -lkernix -lkernix_coreml \
+      -framework Accelerate -framework CoreML -framework Foundation -o app
 
 # Plain C (no acceleration: tensor ops and thread pool only)
 clang -O3 -std=c11 app.c -lkernix -o app
@@ -129,12 +135,21 @@ y = m(x.reshape(-1, m.in_dim))         # the older (rows, in_dim) form also work
 
 m = Model("model.knx", workspace_mb=16)  # workspace limit: larger batches run in chunks (default 64, 0 = no limit)
 m.trim()                                 # return the workspace to the OS while idle after a large batch (weights are kept)
+
+m = Model("model.knx", ane=True)         # Neural Engine assist for convolutional parts (float16, about 1e-3 error)
+m.ane_info()                             # {'segments': 1, 'compiles': 1, 'ane_runs': 385, 'failures': 0}
 ```
 
 - **Input layout**: pass images as `(batch, H, W, C)` (Keras). Convolutional models exported from PyTorch take and return `(batch, C, H, W)` (`m.channels_first` is True); the binding moves the channel axis.
 - **Dtype**: float64 or non-contiguous arrays are converted to contiguous float32. Token ids (Embedding input) are passed as floats too.
 - **Threads**: one `Model` can be called from several threads, but calls run one at a time. For true concurrency, create one `Model` per thread.
-- **Build**: the Python library is an Accelerate build and does not use the GPU. For one-sample-at-a-time inference such as a webcam loop, GPU launch latency would only add cost.
+- **Build**: the Python library is an Accelerate build with the Neural Engine assist and does not use the GPU. For one-sample-at-a-time inference such as a webcam loop, GPU launch latency would only add cost.
+- **Neural Engine assist (`ane=True`)**: off by default, because the Neural Engine computes in float16.
+  - KERNIX finds runs of convolution, pooling, BatchNorm, activation, elementwise, Linear, padding, upsampling and channel concat that contain a convolution. It builds a Core ML model for each run with the batch size fixed, since variable-batch Core ML models lose most of the Neural Engine speedup.
+  - A run is compiled in the background (0.1–0.3 s) once the same batch size arrives twice in a row. Until then, and for batch sizes seen only once, calls take the normal KERNIX path, so no call waits for a compile.
+  - Once compiled, each run is timed on both paths and keeps the faster one for that batch size. If Core ML fails, the run falls back to KERNIX for good.
+  - RNNs, attention and embeddings always stay on KERNIX. Models without convolutions run exactly as with `ane=False`.
+  - Needs macOS 13 or later; otherwise you get a warning and the normal path. `trim()` also releases the Core ML models; ANE-chosen batch sizes are recompiled in the background when they come back.
 
 ### C API
 
@@ -146,6 +161,7 @@ float_tensor* x = float_zeros(4 * m->seq_len, m->in_dim);  /* 4 samples: seq_len
 const float_tensor* y = kernix_model_forward(m, x);        /* 4 × out_dim. Owned by the model: do not free; the next forward overwrites it */
 kernix_model_set_workspace_limit(m, 16 << 20);             /* workspace limit in bytes (0 = no limit) */
 kernix_model_trim(m);                                      /* release the workspace */
+kernix_model_set_ane(m, 1);                                /* Neural Engine assist (-DKERNIX_USE_COREML build): 0, or -1 if unavailable */
 float_free(x);
 kernix_model_free(m);
 ```
@@ -159,6 +175,11 @@ clang -O3 -std=c11 -I./include -DKERNIX_USE_ACCELERATE -framework Accelerate src
 # Metal build (CPU + AMX + GPU): uses the GPU as well for large batches
 clang -O3 -std=c11 -I./include -DKERNIX_USE_ACCELERATE -framework Accelerate \
       -DKERNIX_USE_METAL -fobjc-arc src/kernix_metal.m -framework Metal -framework MetalPerformanceShaders -framework Foundation \
+      src/kernix_runtime.c app.c -o app
+
+# + Neural Engine assist (Core ML, macOS 13 or later)
+clang -O3 -std=c11 -I./include -DKERNIX_USE_ACCELERATE -framework Accelerate \
+      -DKERNIX_USE_COREML -fobjc-arc src/kernix_coreml.m -framework CoreML -framework Foundation \
       src/kernix_runtime.c app.c -o app
 ```
 
@@ -223,7 +244,7 @@ Figures come from the [Benchmarks](#benchmarks) section (Apple M1).
 
 **Limitations**
 - **Large batches** are faster in PyTorch MPS for MLPs: batch 4096 runs at 0.86× (section 6). ResNet at batch 64 is on par (1.0×, section 9).
-- **CNNs are faster in Core ML**: on the ResNet in section 9, Core ML is 1.9× faster at batch 1 and 13× faster at batch 64 (Neural Engine, float16).
+- **CNNs at full precision are faster in Core ML**: on the ResNet in section 9, Core ML is 1.9× faster at batch 1 and 13× faster at batch 64 (Neural Engine, float16). With `ane=True` KERNIX uses the Neural Engine too and is 2.6× faster than its own CPU path at batch 1 and about 10× faster at batch 64, still about 1.4× slower than Core ML alone at batch 64 (section 10).
 - **Elementwise ops at 4096² and above** are memory-bandwidth bound and match PyTorch.
 - **The int8 fingerspelling model** agrees with TFLite on only 98.94% of confirmed webcam predictions, below the 99% target.
 - **Input shapes are fixed in the file** (no dynamic sequence length). Training is not supported.
@@ -235,6 +256,7 @@ include/kernix.h          Tensor structs, 27 ops, matmul, thread pool declaratio
 include/kernix_model.h    .knx loader (validation), shape inference, buffer planning, 21 graph ops, int8 kernels
 src/kernix_runtime.c      Thread pool (part of every build)
 src/kernix_metal.m        Metal: GPU+AMX split matmul, GPU epilogue, elementwise and row kernels, shared buffer cache
+src/kernix_coreml.m       Neural Engine assist: writes graph runs as Core ML NeuralNetwork models, background compiles, predict
 src/kernix_capi.c         C API for the Python binding (python/libkernix.dylib)
 install_mac.sh            Installs headers and static libraries (make lib → build/); install.sh is the same script
 python/kernix.py          Python binding (ctypes + numpy)
@@ -477,6 +499,20 @@ When a batch exceeds the workspace limit, `forward` runs the samples in chunks. 
 - Single-sample inference is much faster because there is no per-op PyTorch overhead.
 - Large-batch CNNs now match PyTorch MPS using the CPU and AMX only, since im2col runs in cache-sized tiles. Core ML with the Neural Engine is still much faster (see [Limitations](#strengths-and-limitations)).
 - Correctness: all 17 PyTorch models and 21 Keras models are within 2e-4 relative error of the original (about 1e-7 in practice, excluding int8).
+
+### 10. Neural Engine assist (`ane=True`)
+
+> Apple M1, Python binding, median of 50 (100 for memory) after the path was chosen, same weights. Error is the maximum relative error against PyTorch CPU
+
+| Model | Batch | KERNIX | **KERNIX `ane=True`** | Core ML CPU+ANE (fp16) | Peak memory added by `ane=True` |
+|---|---:|---:|---:|---:|---:|
+| ResNet (section 9) | 1 | 0.44 ms | **0.17 ms** (2.6×) | 0.28–0.31 ms | +10.8 MB |
+| | 64 | 20.7–22.0 ms | **2.0–2.3 ms** (9.5×) | 1.53–1.61 ms | +14.3 MB |
+| LSTM, GPT, MLP | 1, 64 | | same as KERNIX (no convolution) | | 0 |
+
+- Error with `ane=True` on ResNet is 1.4e-3 (float16), against 4.5e-7 for the normal path.
+- The path was chosen on the 12th–14th call (about 0.3 s of background compile while calls kept being answered on the KERNIX path).
+- Peak memory grows by the Core ML framework and the compiled model. KERNIX keeps its own weights and workspace so it can fall back at any time.
 
 ## Documentation
 

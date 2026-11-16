@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# KERNIX macOS 설치: 헤더(kernix.h, kernix_model.h)와 정적 라이브러리(libkernix.a, libkernix_metal.a)를 PREFIX에 설치.
+# KERNIX macOS 설치: 헤더(kernix.h, kernix_model.h)와 정적 라이브러리(libkernix.a, libkernix_metal.a, libkernix_coreml.a)를 PREFIX에 설치.
 #   ./install_mac.sh                  /usr/local에 설치 (쓰기 권한이 없으면 sudo로)
 #   PREFIX=~/.local ./install_mac.sh  다른 위치에 설치
 #   ./install_mac.sh --uninstall      설치한 파일 삭제
@@ -8,7 +8,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${PREFIX:-/usr/local}"
 HEADERS=(kernix.h kernix_model.h)
-LIBS=(libkernix.a libkernix_metal.a)
+LIBS=(libkernix.a libkernix_metal.a libkernix_coreml.a)
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
     echo "오류: macOS 전용입니다." >&2
@@ -45,11 +45,14 @@ for l in "${LIBS[@]}"; do $SUDO install -m 644 "$SCRIPT_DIR/build/$l" "$PREFIX/l
 cat <<MSG
 KERNIX 설치 완료
   헤더:       $PREFIX/include/{kernix.h,kernix_model.h}
-  라이브러리: $PREFIX/lib/{libkernix.a,libkernix_metal.a}
+  라이브러리: $PREFIX/lib/{libkernix.a,libkernix_metal.a,libkernix_coreml.a}
 
 빌드 예 (CPU + AMX):
   clang -O3 -std=c11 -I$PREFIX/include -DKERNIX_USE_ACCELERATE app.c -L$PREFIX/lib -lkernix -framework Accelerate -o app
 빌드 예 (CPU + AMX + GPU, kernix.h를 쓰는 모든 소스에 -DKERNIX_USE_METAL):
   clang -O3 -std=c11 -I$PREFIX/include -DKERNIX_USE_ACCELERATE -DKERNIX_USE_METAL app.c -L$PREFIX/lib -lkernix -lkernix_metal \\
         -framework Accelerate -framework Metal -framework MetalPerformanceShaders -framework Foundation -o app
+빌드 예 (+ 뉴럴엔진 보조, kernix_model.h를 쓰는 모든 소스에 -DKERNIX_USE_COREML, macOS 13 이상):
+  clang -O3 -std=c11 -I$PREFIX/include -DKERNIX_USE_ACCELERATE -DKERNIX_USE_COREML app.c -L$PREFIX/lib -lkernix -lkernix_coreml \\
+        -framework Accelerate -framework CoreML -framework Foundation -o app
 MSG
