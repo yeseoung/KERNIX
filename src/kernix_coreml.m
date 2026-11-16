@@ -2,6 +2,7 @@
  * 설계: docs/superpowers/specs/2026-11-16-ane-assist-design.md. 구간 찾기와 경로 선택은 include/kernix_model.h */
 #import <Foundation/Foundation.h>
 #import <CoreML/CoreML.h>
+#include <os/lock.h>
 #include "kernix_model.h"
 
 int kernix_coreml_available(void)
@@ -373,4 +374,184 @@ int kernix_coreml_write_spec(const kernix_model* m, int seg, int batch, const ch
     }
     free(model.p);
     return rc;
+}
+
+/* ---- 실행: Core ML 모델 하나 (고정 배치) ---- */
+@interface KernixCoreMLRunner : NSObject
+@property(nonatomic, strong) MLModel* model;
+@property(nonatomic, strong) NSArray<NSNumber*>* inShape;
+@property(nonatomic, strong) NSArray<NSNumber*>* inStrides;
+@property(nonatomic, strong) NSArray<NSNumber*>* outShape;
+@property(nonatomic, strong) NSArray<NSNumber*>* outStrides;
+@property(nonatomic) size_t outCount;
+@end
+@implementation KernixCoreMLRunner
+@end
+
+static NSArray<NSNumber*>* kernix_strides(NSArray<NSNumber*>* shape)
+{
+    NSMutableArray<NSNumber*>* s = [NSMutableArray arrayWithCapacity:shape.count];
+    NSInteger acc = 1;
+    for (NSInteger k = (NSInteger)shape.count - 1; k >= 0; k--) {
+        [s insertObject:@(acc) atIndex:0];
+        acc *= shape[(NSUInteger)k].integerValue;
+    }
+    return s;
+}
+
+/* 구간 seg를 batch 표본 고정으로 컴파일해 불러옴. 실패 시 nil. 임시 파일은 TMPDIR(없으면 NSTemporaryDirectory) 아래에 쓰고 지움 */
+static KernixCoreMLRunner* kernix_coreml_build(const kernix_model* m, int seg, int batch)
+{
+    if (@available(macOS 13.0, *)) {
+        const char* t = getenv("TMPDIR");
+        NSString* dir = t != NULL && *t ? @(t) : NSTemporaryDirectory();
+        NSString* name = [NSString stringWithFormat:@"kernix_%d_%d_%@.mlmodel", getpid(), seg, NSUUID.UUID.UUIDString];
+        NSURL* spec = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:name]];
+        if (kernix_coreml_write_spec(m, seg, batch, spec.fileSystemRepresentation) != 0) return nil;
+        NSError* err = nil;
+        NSURL* compiled = [MLModel compileModelAtURL:spec error:&err];
+        [NSFileManager.defaultManager removeItemAtURL:spec error:nil];
+        if (compiled == nil) return nil;
+        MLModelConfiguration* cfg = [MLModelConfiguration new];
+        cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+        MLModel* model = [MLModel modelWithContentsOfURL:compiled configuration:cfg error:&err];
+        [NSFileManager.defaultManager removeItemAtURL:compiled error:nil]; /* 불러온 뒤에는 필요 없음 (매핑된 파일은 해제 때까지 남음) */
+        if (model == nil) return nil;
+        KernixCoreMLRunner* r = [KernixCoreMLRunner new];
+        r.model = model;
+        r.inShape = model.modelDescription.inputDescriptionsByName[@"x"].multiArrayConstraint.shape;
+        r.outShape = model.modelDescription.outputDescriptionsByName[@"y"].multiArrayConstraint.shape;
+        if (r.inShape.count != 4 || r.outShape.count != 4) return nil;
+        r.inStrides = kernix_strides(r.inShape);
+        r.outStrides = kernix_strides(r.outShape);
+        r.outCount = (size_t)(r.outShape[0].integerValue * r.outStrides[0].integerValue);
+        return r;
+    }
+    return nil;
+}
+
+int kernix_coreml_predict(void* h, const float* x, float* y)
+{
+    if (@available(macOS 13.0, *)) {
+        @autoreleasepool { /* C에서 반복 호출: 호출마다 임시 객체를 비움 */
+            KernixCoreMLRunner* r = (__bridge KernixCoreMLRunner*)h;
+            NSError* err = nil;
+            MLMultiArray* in = [[MLMultiArray alloc] initWithDataPointer:(void*)x shape:r.inShape dataType:MLMultiArrayDataTypeFloat32
+                                                                 strides:r.inStrides deallocator:nil error:&err];
+            MLMultiArray* out = [[MLMultiArray alloc] initWithDataPointer:y shape:r.outShape dataType:MLMultiArrayDataTypeFloat32
+                                                                  strides:r.outStrides deallocator:nil error:&err];
+            if (in == nil || out == nil) return -1;
+            MLDictionaryFeatureProvider* fp = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{ @"x" : in } error:&err];
+            if (fp == nil) return -1;
+            MLPredictionOptions* opt = [MLPredictionOptions new];
+            opt.outputBackings = @{ @"y" : out }; /* 결과를 KERNIX 출력 버퍼에 바로 */
+            id<MLFeatureProvider> res = [r.model predictionFromFeatures:fp options:opt error:&err];
+            if (res == nil) return -1;
+            MLMultiArray* got = [res featureValueForName:@"y"].multiArrayValue;
+            if (got == nil) return -1;
+            if (got.dataPointer != (void*)y) { /* 버퍼를 쓰지 않은 경우: 연속 float32면 복사 */
+                if (got.dataType != MLMultiArrayDataTypeFloat32 || (size_t)got.count != r.outCount) return -1;
+                __block int ok = 0;
+                [got getBytesWithHandler:^(const void* bytes, NSInteger size) {
+                    if ((size_t)size >= r.outCount * sizeof(float)) { memcpy(y, bytes, r.outCount * sizeof(float)); ok = 1; }
+                }];
+                if (!ok) return -1;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
+void kernix_coreml_release(void* h)
+{
+    if (h != NULL) CFBridgingRelease(h);
+}
+
+/* ---- 뒤 컴파일 큐: 모델당 직렬 큐 하나, 구간마다 결과 칸 하나 ---- */
+@interface KernixCoreMLCtx : NSObject {
+@public
+    dispatch_queue_t queue;
+    os_unfair_lock lock;
+    int n;
+    int* pending;   /* 컴파일 중인 표본 수, 0 = 없음 */
+    void** ready;   /* 끝난 모델 (CFBridgingRetain), poll이 가져감 */
+    int* ready_b;
+    int* failed;
+}
+@end
+@implementation KernixCoreMLCtx
+- (void)dealloc
+{
+    for (int k = 0; k < n; k++) kernix_coreml_release(ready[k]);
+    free(pending); free(ready); free(ready_b); free(failed);
+}
+@end
+
+void* kernix_coreml_ctx_new(int n_seg)
+{
+    KernixCoreMLCtx* c = [KernixCoreMLCtx new];
+    c->queue = dispatch_queue_create("kernix.coreml.compile", DISPATCH_QUEUE_SERIAL);
+    c->lock = OS_UNFAIR_LOCK_INIT;
+    c->n = n_seg;
+    c->pending = calloc((size_t)n_seg, sizeof(int));
+    c->ready = calloc((size_t)n_seg, sizeof(void*));
+    c->ready_b = calloc((size_t)n_seg, sizeof(int));
+    c->failed = calloc((size_t)n_seg, sizeof(int));
+    if (c->pending == NULL || c->ready == NULL || c->ready_b == NULL || c->failed == NULL) return NULL;
+    return (void*)CFBridgingRetain(c);
+}
+
+void kernix_coreml_ctx_free(void* ctx)
+{
+    if (ctx == NULL) return;
+    KernixCoreMLCtx* c = (__bridge KernixCoreMLCtx*)ctx;
+    dispatch_sync(c->queue, ^{}); /* 직렬 큐: 돌고 있는 컴파일이 끝나기를 기다림 */
+    CFBridgingRelease(ctx);
+}
+
+int kernix_coreml_request(void* ctx, const kernix_model* m, int seg, int batch)
+{
+    KernixCoreMLCtx* c = (__bridge KernixCoreMLCtx*)ctx;
+    if (seg < 0 || seg >= c->n || batch < 1) return 0;
+    os_unfair_lock_lock(&c->lock);
+    const int busy = c->pending[seg] != 0;
+    if (!busy) c->pending[seg] = batch;
+    os_unfair_lock_unlock(&c->lock);
+    if (busy) return 0;
+    dispatch_async(c->queue, ^{
+        @autoreleasepool {
+            KernixCoreMLRunner* r = kernix_coreml_build(m, seg, batch); /* m의 가중치·모양은 로드 뒤 바뀌지 않음, free가 큐를 기다림 */
+            os_unfair_lock_lock(&c->lock);
+            c->pending[seg] = 0;
+            if (r != nil) {
+                kernix_coreml_release(c->ready[seg]); /* 가져가지 않은 이전 결과 */
+                c->ready[seg] = (void*)CFBridgingRetain(r);
+                c->ready_b[seg] = batch;
+            } else {
+                c->failed[seg] = 1;
+            }
+            os_unfair_lock_unlock(&c->lock);
+        }
+    });
+    return 1;
+}
+
+int kernix_coreml_poll(void* ctx, int seg, void** h, int* batch)
+{
+    KernixCoreMLCtx* c = (__bridge KernixCoreMLCtx*)ctx;
+    if (seg < 0 || seg >= c->n) return 0;
+    int r = 0;
+    os_unfair_lock_lock(&c->lock);
+    if (c->failed[seg]) {
+        c->failed[seg] = 0;
+        r = -1;
+    } else if (c->ready[seg] != NULL) {
+        *h = c->ready[seg];
+        *batch = c->ready_b[seg];
+        c->ready[seg] = NULL;
+        r = 1;
+    }
+    os_unfair_lock_unlock(&c->lock);
+    return r;
 }

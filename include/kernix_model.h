@@ -240,6 +240,8 @@ typedef struct {
 #define KERNIX_WORKSPACE_LIMIT ((size_t)64 << 20)
 #endif
 
+#define KERNIX_ANE_DECS 8 /* 구간마다 기억하는 표본 수별 결정 수 */
+
 /* ANE 보조 구간 (docs/superpowers/specs/2026-11-16-ane-assist-design.md): 연속한 단계 [first, last]를 Core ML 모델 하나로
  * 뉴럴엔진에서 실행. 구간 밖에서 읽는 값은 in_v 하나, 구간 밖으로 나가는 값은 out_v 하나 */
 typedef struct kernix_ane_seg {
@@ -248,6 +250,12 @@ typedef struct kernix_ane_seg {
     int ml_batch;   /* ml의 고정 표본 수, 없으면 0 */
     int broken;     /* 컴파일·예측 실패: 이후 KERNIX 경로만 */
     int compiles, ane_runs, failures;
+    int req_b;      /* 뒤에서 컴파일 중인 표본 수, 0 = 없음 */
+    int prev_b;     /* 직전 실행의 표본 수 */
+    int dec_n, dec_b[KERNIX_ANE_DECS]; /* 표본 수별 결정 (가득 차면 오래된 것부터 덮어씀) */
+    signed char dec[KERNIX_ANE_DECS];  /* +1 = ANE, -1 = KERNIX */
+    int kt_b, kn, an, warm; /* kt: 표본 kt_b개의 KERNIX 구간 시간 kn개, at: ANE 시간 an개 (ns), warm: 지금 모델을 예열했는지 */
+    double kt[3], at[3];
 } kernix_ane_seg;
 
 typedef struct { int segments, compiles, ane_runs, failures; } kernix_ane_info;
@@ -290,6 +298,16 @@ struct kernix_model;
 /* 구간 seg를 표본 batch개 고정의 NeuralNetwork .mlmodel로 path에 씀. 입력 "x"·출력 "y"는 KERNIX 버퍼 모양 (batch, H, W, C).
  * 성공 0, 실패 -1 */
 int kernix_coreml_write_spec(const struct kernix_model* m, int seg, int batch, const char* path);
+/* 뒤 컴파일 큐 (모델당 하나, 직렬). free는 돌고 있는 컴파일이 끝나기를 기다림 */
+void* kernix_coreml_ctx_new(int n_seg);
+void kernix_coreml_ctx_free(void* ctx);
+/* 구간 seg의 batch 표본 모델을 뒤에서 컴파일. 시작했으면 1, 그 구간의 컴파일이 이미 돌고 있으면 0 */
+int kernix_coreml_request(void* ctx, const struct kernix_model* m, int seg, int batch);
+/* 막히지 않음: 1 = 완료(*h 소유권이 넘어감), -1 = 실패, 0 = 없음 */
+int kernix_coreml_poll(void* ctx, int seg, void** h, int* batch);
+/* x: 구간 입력 버퍼, y: 구간 출력 버퍼 (KERNIX 버퍼 모양 그대로, 복사 없음). 성공 0 */
+int kernix_coreml_predict(void* h, const float* x, float* y);
+void kernix_coreml_release(void* h); /* NULL 가능 */
 #endif
 
 enum { KERNIX_SHAPE_COUNT, KERNIX_SHAPE_ALLOC, KERNIX_SHAPE_VIEW };
@@ -1789,6 +1807,7 @@ static inline int kernix_model_set_ane(kernix_model* m, int on)
     if (!kernix_coreml_available()) return -1;
     /* shortcut: 버퍼 재배치 중 메모리 부족이면 모델을 다시 불러와야 함, 실제로 보이면 이전 배치로 되돌리는 코드 추가 */
     if (m->seg_start == NULL && kernix_ane_find(m) != 0) return -1;
+    if (m->n_seg > 0 && m->coreml == NULL && (m->coreml = kernix_coreml_ctx_new(m->n_seg)) == NULL) return -1;
     m->ane = 1;
     return 0;
 #else
@@ -1808,6 +1827,157 @@ static inline void kernix_model_ane_info(const kernix_model* m, kernix_ane_info*
     }
 }
 
+/* 단계 i를 한 번 실행 (B: 이번 조각의 표본 수). 성공 0, 실패 -1 */
+static inline int kernix_step_run(kernix_model* m, int i, int B)
+{
+    kernix_step* s = &m->steps[i];
+    const float_tensor* a = &m->views[s->inp[0]];
+    float_tensor* y = &m->views[i + 1];
+    const kernix_val* vi = &m->vals[s->inp[0]];
+    const kernix_val* vo = &m->vals[i + 1];
+    const size_t rows = (size_t)y->row, cols = (size_t)y->col;
+    switch (s->kind) {
+    case KERNIX_OP_LINEAR:
+        if (s->q != NULL && a->row <= KERNIX_INT8_MAX_ROWS) { /* 행이 적은 int8: sdot (bias는 커널이 더함) */
+            if (kernix_qmatmul(a->tensor, a->row, s->q, s->bias, 0, y->tensor) != 0) return -1;
+            kernix_bias_act(y->tensor, rows, cols, NULL, s->act, s->alpha);
+        } else if (kernix_dense(a, s->q != NULL ? s->deq : s->w, y, s->bias, s->act, s->alpha) != 0) { /* 사본이 없으면 -1 */
+            return -1;
+        }
+        break;
+    case KERNIX_OP_LSTM:
+    case KERNIX_OP_GRU:
+    case KERNIX_OP_RNN:
+        if (kernix_rnn_run(s, a, y) != 0) return -1;
+        break;
+    case KERNIX_OP_ACT:
+        kernix_copy_if(a, y);
+        kernix_bias_act(y->tensor, rows, cols, NULL, s->act, s->alpha);
+        break;
+    case KERNIX_OP_LAYERNORM: kernix_layer_norm_rows_into(a->tensor, y->tensor, rows, cols, s->gamma, s->beta, s->eps); break;
+    case KERNIX_OP_SOFTMAX: floats_softmax_into(a->tensor, y->tensor, rows, cols); break;
+    case KERNIX_OP_CONV:
+        if (kernix_conv_run(s, vi, a, vo, y, m->col != NULL ? m->col->tensor : NULL) != 0) return -1;
+        break;
+    case KERNIX_OP_POOL: kernix_pooling_run(s, vi, a, vo, y); break;
+    case KERNIX_OP_GLOBAL_POOL: kernix_global_pool_run(s, vi, a, y); break;
+    case KERNIX_OP_RESHAPE: break; /* 같은 버퍼의 보기 */
+    case KERNIX_OP_PERMUTE: kernix_permute_run(s, vi, a, y); break;
+    case KERNIX_OP_BINARY: kernix_binary_run(s, vi, a, &m->vals[s->inp[1]], &m->views[s->inp[1]], vo, y); break;
+    case KERNIX_OP_CONCAT: kernix_concat_run(s, m, vo, y); break;
+    case KERNIX_OP_EMBEDDING: kernix_embedding_run(s, a, y); break;
+    case KERNIX_OP_AFFINE: {
+        const float* g = s->gamma;
+        const float* b = s->beta;
+        const float* xin = a->tensor;
+        float* o = y->tensor;
+        kernix_par(rows, cols, ^(size_t r0, size_t nr) {
+            for (size_t r = r0; r < r0 + nr; r++) vDSP_vma(xin + r * cols, 1, g, 1, b, 1, o + r * cols, 1, cols);
+        });
+        break;
+    }
+    case KERNIX_OP_ADD_CONST: {
+        const size_t per = (size_t)s->in;
+        for (int b = 0; b < B; b++) vDSP_vadd(a->tensor + b * per, 1, s->cst, 1, y->tensor + b * per, 1, per);
+        break;
+    }
+    case KERNIX_OP_ATTENTION:
+        if (kernix_attention_run(s, m, y) != 0) return -1;
+        break;
+    case KERNIX_OP_SELECT: kernix_select_run(s, vi, a, y); break;
+    case KERNIX_OP_PAD: kernix_pad_run(s, vi, a, vo, y); break;
+    case KERNIX_OP_UPSAMPLE: kernix_upsample_run(s, vi, a, vo, y); break;
+    }
+    return 0;
+}
+
+#if defined(KERNIX_USE_COREML)
+/* 표본 수 B에 대한 결정: +1 = ANE, -1 = KERNIX, 0 = 아직 */
+static inline int kernix_ane_dec(const kernix_ane_seg* g, int B)
+{
+    const int n = g->dec_n < KERNIX_ANE_DECS ? g->dec_n : KERNIX_ANE_DECS;
+    for (int k = 0; k < n; k++)
+        if (g->dec_b[k] == B) return g->dec[k];
+    return 0;
+}
+
+static inline double kernix_med3(const double* t, int n) /* n개(1~3)의 중앙값 */
+{
+    if (n == 1) return t[0];
+    if (n == 2) return (t[0] + t[1]) / 2;
+    const double a = t[0], b = t[1], c = t[2];
+    return a > b ? (b > c ? b : a > c ? c : a) : (a > c ? a : b > c ? c : b);
+}
+
+static inline void kernix_ane_drop(kernix_ane_seg* g)
+{
+    kernix_coreml_release(g->ml);
+    g->ml = NULL;
+    g->ml_batch = 0;
+}
+
+/* 구간 k를 표본 B개로 실행: ANE로 결정됐거나 재는 중이면 Core ML, 아니면 KERNIX 단계들 (스펙 §5.4). 성공 0, 실패 -1 */
+static inline int kernix_ane_seg_run(kernix_model* m, int k, int B)
+{
+    kernix_ane_seg* g = &m->seg[k];
+    if (!g->broken) {
+        void* h = NULL;
+        int hb = 0;
+        const int r = kernix_coreml_poll(m->coreml, k, &h, &hb);
+        if (r != 0) g->req_b = 0;
+        if (r == 1) { kernix_ane_drop(g); g->ml = h; g->ml_batch = hb; g->warm = 0; g->an = 0; }
+        if (r == -1) { g->broken = 1; g->failures++; kernix_ane_drop(g); }
+    }
+    const int d = kernix_ane_dec(g, B);
+    if (!g->broken && d >= 0 && g->ml != NULL && g->ml_batch == B) {
+        const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        if (kernix_coreml_predict(g->ml, m->views[g->in_v].tensor, m->views[g->out_v].tensor) == 0) {
+            g->ane_runs++;
+            if (d == 0 && !g->warm) {
+                g->warm = 1; /* 첫 실행은 예열: 재지 않음 */
+            } else if (d == 0) {
+                g->at[g->an++] = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+                if (g->an == 3) { /* KERNIX 쪽은 컴파일을 요청하기 전에 같은 B로 잰 시간 (kt_b == B, kn ≥ 1) */
+                    const int ane = g->kt_b == B && g->kn > 0 && kernix_med3(g->at, 3) < kernix_med3(g->kt, g->kn);
+                    const int slot = g->dec_n++ % KERNIX_ANE_DECS;
+                    g->dec_b[slot] = B;
+                    g->dec[slot] = ane ? 1 : -1;
+                    if (!ane) kernix_ane_drop(g);
+                }
+            }
+            g->prev_b = B;
+            return 0;
+        }
+        g->broken = 1; /* 예측 실패: 이번 호출부터 KERNIX 경로 */
+        g->failures++;
+        kernix_ane_drop(g);
+    }
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (int i = g->first; i <= g->last; i++)
+        if (kernix_step_run(m, i, B) != 0) return -1;
+    if (!g->broken && d >= 0) {
+        /* 지금 모델이 결정 전이 아니면(없거나 결정 난 다른 크기) 새 크기를 재고 컴파일할 수 있음. 결정 전 모델이 있으면 그 크기에 묶임 */
+        const int free_slot = g->req_b == 0 && (g->ml == NULL || kernix_ane_dec(g, g->ml_batch) != 0);
+        if (d == 0) {
+            if (B != g->kt_b && free_slot) { g->kt_b = B; g->kn = 0; }
+            if (B == g->kt_b) {
+                const double dt = (double)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+                if (g->kn < 3) g->kt[g->kn++] = dt;
+                else { g->kt[0] = g->kt[1]; g->kt[1] = g->kt[2]; g->kt[2] = dt; }
+            }
+        }
+        /* 같은 크기가 두 번 연속 오면 컴파일 (한 번만 나오는 크기는 건너뜀). ANE로 결정된 크기는 trim 뒤나 다른 크기 뒤에 다시 컴파일 */
+        if (B == g->prev_b && g->ml_batch != B && free_slot && (d == 1 || B == g->kt_b) &&
+            kernix_coreml_request(m->coreml, m, k, B)) {
+            g->compiles++;
+            g->req_b = B;
+        }
+    }
+    g->prev_b = B;
+    return 0;
+}
+#endif
+
 /* 작업 버퍼가 x->row행에 맞춰져 있을 때 모든 단계를 한 번 실행 */
 static inline const float_tensor* kernix_model_run(kernix_model* m, const float_tensor* x)
 {
@@ -1819,64 +1989,15 @@ static inline const float_tensor* kernix_model_run(kernix_model* m, const float_
     m->out_view = (float_tensor){ B, m->out_dim, m->views[m->out_v].tensor };
     if (B == 0) return &m->out_view;
     for (int i = 0; i < m->n_steps; i++) {
-        kernix_step* s = &m->steps[i];
-        const float_tensor* a = &m->views[s->inp[0]];
-        float_tensor* y = &m->views[i + 1];
-        const kernix_val* vi = &m->vals[s->inp[0]];
-        const kernix_val* vo = &m->vals[i + 1];
-        const size_t rows = (size_t)y->row, cols = (size_t)y->col;
-        switch (s->kind) {
-        case KERNIX_OP_LINEAR:
-            if (s->q != NULL && a->row <= KERNIX_INT8_MAX_ROWS) { /* 행이 적은 int8: sdot (bias는 커널이 더함) */
-                if (kernix_qmatmul(a->tensor, a->row, s->q, s->bias, 0, y->tensor) != 0) return NULL;
-                kernix_bias_act(y->tensor, rows, cols, NULL, s->act, s->alpha);
-            } else if (kernix_dense(a, s->q != NULL ? s->deq : s->w, y, s->bias, s->act, s->alpha) != 0) { /* 사본이 없으면 -1 */
-                return NULL;
-            }
-            break;
-        case KERNIX_OP_LSTM:
-        case KERNIX_OP_GRU:
-        case KERNIX_OP_RNN:
-            if (kernix_rnn_run(s, a, y) != 0) return NULL;
-            break;
-        case KERNIX_OP_ACT:
-            kernix_copy_if(a, y);
-            kernix_bias_act(y->tensor, rows, cols, NULL, s->act, s->alpha);
-            break;
-        case KERNIX_OP_LAYERNORM: kernix_layer_norm_rows_into(a->tensor, y->tensor, rows, cols, s->gamma, s->beta, s->eps); break;
-        case KERNIX_OP_SOFTMAX: floats_softmax_into(a->tensor, y->tensor, rows, cols); break;
-        case KERNIX_OP_CONV:
-            if (kernix_conv_run(s, vi, a, vo, y, m->col != NULL ? m->col->tensor : NULL) != 0) return NULL;
-            break;
-        case KERNIX_OP_POOL: kernix_pooling_run(s, vi, a, vo, y); break;
-        case KERNIX_OP_GLOBAL_POOL: kernix_global_pool_run(s, vi, a, y); break;
-        case KERNIX_OP_RESHAPE: break; /* 같은 버퍼의 보기 */
-        case KERNIX_OP_PERMUTE: kernix_permute_run(s, vi, a, y); break;
-        case KERNIX_OP_BINARY: kernix_binary_run(s, vi, a, &m->vals[s->inp[1]], &m->views[s->inp[1]], vo, y); break;
-        case KERNIX_OP_CONCAT: kernix_concat_run(s, m, vo, y); break;
-        case KERNIX_OP_EMBEDDING: kernix_embedding_run(s, a, y); break;
-        case KERNIX_OP_AFFINE: {
-            const float* g = s->gamma;
-            const float* b = s->beta;
-            const float* xin = a->tensor;
-            float* o = y->tensor;
-            kernix_par(rows, cols, ^(size_t r0, size_t nr) {
-                for (size_t r = r0; r < r0 + nr; r++) vDSP_vma(xin + r * cols, 1, g, 1, b, 1, o + r * cols, 1, cols);
-            });
-            break;
+#if defined(KERNIX_USE_COREML)
+        if (m->ane && m->seg_start[i] >= 0) { /* ANE 구간: 구간 함수가 실행하고 끝 단계로 건너뜀 */
+            const int k = m->seg_start[i];
+            if (kernix_ane_seg_run(m, k, B) != 0) return NULL;
+            i = m->seg[k].last;
+            continue;
         }
-        case KERNIX_OP_ADD_CONST: {
-            const size_t per = (size_t)s->in;
-            for (int b = 0; b < B; b++) vDSP_vadd(a->tensor + b * per, 1, s->cst, 1, y->tensor + b * per, 1, per);
-            break;
-        }
-        case KERNIX_OP_ATTENTION:
-            if (kernix_attention_run(s, m, y) != 0) return NULL;
-            break;
-        case KERNIX_OP_SELECT: kernix_select_run(s, vi, a, y); break;
-        case KERNIX_OP_PAD: kernix_pad_run(s, vi, a, vo, y); break;
-        case KERNIX_OP_UPSAMPLE: kernix_upsample_run(s, vi, a, vo, y); break;
-        }
+#endif
+        if (kernix_step_run(m, i, B) != 0) return NULL;
     }
     return &m->out_view;
 }
