@@ -42,5 +42,6 @@ python-lib: src/kernix_capi.c src/kernix_coreml.m include/kernix.h include/kerni
 clean::
 	rm -rf build python/libkernix.dylib python/__pycache__
 
-# 테스트·벤치 타깃 (저장소에는 없음, 로컬 test/에만)
--include test/test.mk
+# 테스트 타깃 (make test, CI가 실행). 로컬 전용 벤치는 test/bench.mk (공개 저장소에는 없음)
+include test/test.mk
+-include test/bench.mk

@@ -64,8 +64,17 @@ dkms.conf
 # Build outputs
 build/
 
-# 공개하지 않음: 테스트·벤치(로컬 전용), 개인 메모, 작업 계획, 수어 프로젝트 전용 문서
-test/
+# 공개하지 않음: 벤치·로컬 테스트, 개인 메모, 작업 계획, 수어 프로젝트 전용 문서. 공개 테스트(CI)만 예외
+test/*
+!test/test.mk
+!test/pool_test.c
+!test/model_test.c
+!test/mlp_bench.py
+!test/zoo_torch_test.py
+!test/zoo_keras_test.py
+!test/knx_fuzz.c
+!test/knx_fuzz_test.py
+!test/verify_test.py
 info.md
 README.ko.md
 docs/superpowers/
