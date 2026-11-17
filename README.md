@@ -15,7 +15,7 @@
 - [Strengths and limitations](#strengths-and-limitations)
 - [Architecture](#architecture)
 - [Benchmarks](#benchmarks)
-- [Documentation](#documentation) · [Roadmap](#roadmap)
+- [Tests](#tests) · [Documentation](#documentation) · [Roadmap](#roadmap)
 
 ## Features
 
@@ -528,6 +528,15 @@ When a batch exceeds the workspace limit, `forward` runs the samples in chunks. 
 - Error with `ane=True` on ResNet is 1.4e-3 (float16), against 4.5e-7 for the normal path.
 - The path was chosen on the 12th–14th call (about 0.3 s of background compile while calls kept being answered on the KERNIX path).
 - Peak memory grows by the Core ML framework and the compiled model. KERNIX keeps its own weights and workspace so it can fall back at any time.
+
+## Tests
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install torch tensorflow   # reference outputs for the PyTorch and Keras model zoos
+make test
+```
+
+`make test` runs the thread pool test, the C model runtime checks (Metal and Accelerate builds), 17 PyTorch and 21 Keras reference models (plus checks that unsupported layers are rejected), `.knx` loader fuzzing under ASan/UBSan, and the `tools/verify.py` tests. [CI](.github/workflows/test.yml) runs it on Apple Silicon for every push to `main` and every pull request. The Neural Engine assist is tested locally only, since CI runners have no Neural Engine.
 
 ## Documentation
 
