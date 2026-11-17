@@ -13,7 +13,7 @@ ACTS = {"relu": "relu", "gelu": "gelu", "silu": "silu", "swish": "silu", "sigmoi
         "softsign": "softsign", "leaky_relu": "leaky_relu", "linear": None, "softmax": "softmax"}
 ALPHA = {"leaky_relu": 0.2, "elu": 1.0}  # 활성화 함수 기본 인자 (keras.activations)
 IDENTITY = {"Dropout", "SpatialDropout1D", "SpatialDropout2D", "GaussianNoise", "GaussianDropout", "AlphaDropout",
-            "ActivityRegularization", "InputLayer", "Masking"}
+            "ActivityRegularization", "InputLayer"}
 
 
 def _np(v):
@@ -101,6 +101,8 @@ def _layer(g, layer, node, xs):
     s = g.shape(x) if x is not None else None
     if kind in IDENTITY:
         return [x]
+    if kind == "Masking":  # KERNIX에는 마스크가 없음: 항등으로 넘기면 어텐션 등이 패딩 입력에서 조용히 틀림
+        raise ValueError("Masking은 지원하지 않음 (패딩 마스크 없음). 패딩 없이 고정 길이로만 쓴다면 Masking을 빼고 다시 저장")
     if isinstance(layer, keras.Model):  # 중첩된 모델 (Sequential 안의 Sequential, 백본 등)
         return _subgraph(g, layer, xs)
     if kind == "Dense" or (kind == "TimeDistributed" and type(layer.layer).__name__ == "Dense"):

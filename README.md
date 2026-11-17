@@ -235,7 +235,7 @@ float_tensor* z = floats_fma_relu_metal(a, x, b);  /* relu(a·x + b) in a single
 
 **Not supported** (rejected at export)
 - Layers: ConvTranspose (Conv2DTranspose), GroupNorm
-- Masks: attention padding masks (`attention_mask`, `key_padding_mask`), non-causal masks, Embedding `mask_zero`
+- Masks: attention padding masks (`attention_mask`, `key_padding_mask`), non-causal masks, Embedding `mask_zero`, the Keras `Masking` layer
 - Inputs: Keras models trained channels_first, inputs with undefined length
 - RNN: stateful RNNs, Keras GRU `reset_after=False`
 - Other: Keras `Lambda`, indexing that slices a middle axis, permutes that move the batch axis
