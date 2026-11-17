@@ -10,7 +10,7 @@
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
-- [Usage](#usage): model conversion, Python API, C API, tensor library
+- [Usage](#usage): model conversion, verification, Python API, C API, tensor library
 - [Supported models and layers](#supported-models-and-layers)
 - [Strengths and limitations](#strengths-and-limitations)
 - [Architecture](#architecture)
@@ -122,6 +122,20 @@ python tools/convert.py model.h5 model.knx [--quantize int8]
 - **Input shapes are fixed.** Sequence length and image size are stored in the file, so export again for a different length.
 - **Unsupported layers or settings** stop the export with a `ValueError` that names the reason ([supported list](#supported-models-and-layers)).
 - **Warning**: `torch.load` unpickles the file, which runs any code inside it. Only convert files you created yourself.
+
+### Verifying a converted model
+
+```bash
+# with a Python that has the original framework (tensorflow for .h5/.keras/.tflite, torch for .pt/.pth)
+python tools/verify.py model.h5 model.knx [--input x.npy] [--batch 64] [--tol 1e-4] [--ane]
+python tools/verify.py model.tflite model.knx
+```
+
+- Feeds the same input to the original model and to KERNIX, then prints the maximum relative error (`max|a-b| / max|a|`), the prediction (argmax) agreement, and the time for batch 1 and the full batch (median of 20 after warm-up).
+- **Exit code** 1 when the error exceeds `--tol` (default 1e-4), so it can run in CI. int8 models and `--ane` (float16) have larger errors by design: raise `--tol` yourself; it is never loosened automatically.
+- **Input**: `--input` takes a `.npy` whose first axis is the batch. Without it, 64 standard-normal samples (seed 0) are used; agreement is only meaningful on real data. Models with integer inputs (Embedding) need `--input`.
+- `.tflite` files run one sample at a time (many are fixed to batch 1).
+- Fingerspelling LSTM from section 7, random input: error 4.5e-7 against TFLite, 100% agreement, batch 64 in 0.25 ms (TFLite 2.3 ms).
 
 ### Python API
 
@@ -261,6 +275,7 @@ src/kernix_capi.c         C API for the Python binding (python/libkernix.dylib)
 install_mac.sh            Installs headers and static libraries (make lib → build/); install.sh is the same script
 python/kernix.py          Python binding (ctypes + numpy)
 tools/convert.py          Conversion command (picks PyTorch or Keras by extension)
+tools/verify.py           Compares a .knx with its original model (error, agreement, time; exit code 1 on mismatch)
 tools/export_torch.py     PyTorch → .knx (sequential MLP as KNX1/2, everything else as KNX3 via torch_graph.py and torch.fx)
 tools/export_keras.py     Keras → .knx (sequential LSTM/Dense as KNX1/2, everything else as KNX3 via keras_graph.py)
 tools/knx3.py             KNX3 graph writer (shared by both graph exporters); knx_quant.py: int8 weight blocks
